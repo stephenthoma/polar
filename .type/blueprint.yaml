@@ -1,0 +1,719 @@
+# Repo-level environment blueprint for stephenthoma/polar (Devin blueprint format).
+# Verified in a Type cloud sandbox (Debian 13, 8 GiB cgroup memory, 10 GB root disk with
+# /var/lib/docker on a separate volume). Deps come from lockfiles; local Docker infra
+# (Postgres, Redis, MinIO, Tinybird local); migrations + seed; API :8000, worker, Next.js
+# web :3000 and a same-origin preview proxy :4000 (API under /api).
+# Contains no secrets. Helper scripts are generated into $HOME/.polar-devin by initialize.
+
+initialize:
+  - name: "System packages (only when missing)"
+    run: |
+      SUDO=""; [ "$(id -u)" -eq 0 ] || SUDO="sudo"
+      missing=""
+      for c in curl git jq make gcc xz; do command -v "$c" >/dev/null 2>&1 || missing=1; done
+      if [ -n "$missing" ]; then
+        $SUDO apt-get update
+        $SUDO apt-get install -y --no-install-recommends ca-certificates curl git jq build-essential xz-utils python3
+      fi
+
+  - name: "Node.js 24.22.2 in a private prefix (leaves any system/nvm Node untouched)"
+    run: |
+      NODE_VERSION=24.22.2
+      NODE_HOME="$HOME/.local/share/polar-node/v$NODE_VERSION"
+      if [ ! -x "$NODE_HOME/bin/node" ]; then
+        mkdir -p "$HOME/.local/share/polar-node"
+        curl -fsSL "https://nodejs.org/dist/v$NODE_VERSION/node-v$NODE_VERSION-linux-x64.tar.xz" \
+          | tar -xJ -C "$HOME/.local/share/polar-node"
+        mv "$HOME/.local/share/polar-node/node-v$NODE_VERSION-linux-x64" "$NODE_HOME"
+      fi
+      "$NODE_HOME/bin/node" --version
+
+  - name: "uv + Python 3.14"
+    run: |
+      export PATH="$HOME/.local/bin:$PATH"
+      command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
+      export PATH="$HOME/.local/bin:$PATH"
+      uv python install 3.14
+      # Devin persists PATH via $ENVRC; Type has no $ENVRC, so guard it.
+      if [ -n "${ENVRC:-}" ]; then echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$ENVRC"; fi
+
+  - name: "Docker Engine + Compose plugin (overlay2 storage)"
+    run: |
+      SUDO=""; [ "$(id -u)" -eq 0 ] || SUDO="sudo"
+      if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
+        curl -fsSL https://get.docker.com | $SUDO sh
+      fi
+      # Keep image/layer data in /var/lib/docker (classic overlay2) instead of the containerd
+      # snapshotter, whose content store lands on the small root disk. Only when unconfigured.
+      if [ ! -f /etc/docker/daemon.json ]; then
+        $SUDO mkdir -p /etc/docker
+        echo '{"storage-driver":"overlay2","features":{"containerd-snapshotter":false}}' | $SUDO tee /etc/docker/daemon.json >/dev/null
+      fi
+      $SUDO usermod -aG docker "$(id -un)" 2>/dev/null || true
+      docker --version
+
+  - name: "Polar helper scripts ($HOME/.polar-devin)"
+    run: |
+      D="$HOME/.polar-devin"
+      mkdir -p "$D"
+
+      cat > "$D/common.sh" <<'POLAR_EOF'
+      # Shared by the helpers. Resolve the repo root without machine-specific paths:
+      # POLAR_ROOT if set, else the git toplevel of the current directory, else the
+      # Type checkout location ($HOME/type-org/repos/stephenthoma/polar).
+      export PATH="$HOME/.local/share/polar-node/v24.22.2/bin:$HOME/.local/bin:$PATH"
+      ROOT="${POLAR_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
+      if [ ! -f "$ROOT/server/pyproject.toml" ] && [ -f "$HOME/type-org/repos/stephenthoma/polar/server/pyproject.toml" ]; then
+        ROOT="$HOME/type-org/repos/stephenthoma/polar"
+      fi
+      if [ ! -f "$ROOT/server/pyproject.toml" ] || [ ! -f "$ROOT/clients/package.json" ]; then
+        echo "Run from inside the polar checkout or set POLAR_ROOT (got: $ROOT)" >&2
+        exit 1
+      fi
+      export POLAR_ROOT="$ROOT"
+      SUDO=""; [ "$(id -u)" -eq 0 ] || SUDO="sudo"
+      LOGS="${POLAR_LOGS:-/tmp/polar-logs}"; mkdir -p "$LOGS"
+      POLAR_EOF
+
+      cat > "$D/setup.sh" <<'POLAR_EOF'
+      #!/usr/bin/env bash
+      # Incremental dependency/build preparation (same as the blueprint's maintenance).
+      # Safe to re-run: each step is a no-op when lockfiles/artifacts are unchanged.
+      set -euo pipefail
+      . "$HOME/.polar-devin/common.sh"
+      cd "$ROOT"
+      PNPM_VERSION=$(sed -n 's/.*"packageManager": *"pnpm@\([0-9.]*\).*/\1/p' clients/package.json)
+      PNPM_PREFIX="$HOME/.local/share/polar-pnpm/$PNPM_VERSION"
+      [ -x "$PNPM_PREFIX/bin/pnpm" ] || npm install -g --prefix "$PNPM_PREFIX" "pnpm@$PNPM_VERSION"
+      mkdir -p "$HOME/.local/bin"
+      ln -sf "$PNPM_PREFIX/bin/pnpm" "$HOME/.local/bin/pnpm"
+      ln -sf "$PNPM_PREFIX/bin/pnpx" "$HOME/.local/bin/pnpx"
+      if [ ! -f server/.env ] || [ ! -f clients/apps/web/.env.local ]; then ./dev/setup-environment < /dev/null >/dev/null; fi
+      uv sync --dev --frozen --directory server
+      pnpm --dir clients install --frozen-lockfile
+      [ -f server/emails/bin/react-email-pkg ] || uv run --directory server task emails
+      [ -f server/polar/backoffice/static/scripts.js ] || uv run --directory server task backoffice
+      pnpm --dir clients exec turbo run build --filter='./packages/*'
+      echo "polar setup ready"
+      POLAR_EOF
+
+      cat > "$D/infra.sh" <<'POLAR_EOF'
+      #!/usr/bin/env bash
+      # Start local infrastructure (Docker: Postgres, Redis, MinIO, Tinybird local),
+      # configure the local Tinybird token, migrate, and seed sample data (idempotent).
+      set -euo pipefail
+      . "$HOME/.polar-devin/common.sh"
+      cd "$ROOT/server"
+
+      [ -x /var ] && [ -r /var ] || $SUDO chmod 755 /var
+      if ! $SUDO docker info >/dev/null 2>&1; then
+        $SUDO systemctl start docker >/dev/null 2>&1 || $SUDO service docker start >/dev/null 2>&1 || true
+        if ! $SUDO docker info >/dev/null 2>&1 && ! pgrep -x dockerd >/dev/null; then
+          # Stale runtime state survives VM snapshot restores (no tmpfs /run). Safe: no daemon runs.
+          for pf in /var/run/docker.pid /var/run/docker/containerd/containerd.pid /run/docker/containerd/containerd.pid; do
+            if $SUDO test -f "$pf" && ! $SUDO kill -0 "$($SUDO cat "$pf")" 2>/dev/null; then $SUDO rm -f "$pf" /var/run/docker.sock; fi
+          done
+          $SUDO rm -rf /var/run/docker/containerd/daemon/io.containerd.runtime.v2.task/moby
+          $SUDO setsid nohup dockerd > "$LOGS/dockerd.log" 2>&1 < /dev/null &
+        fi
+        for _ in $(seq 1 180); do $SUDO docker info >/dev/null 2>&1 && break; sleep 1; done
+      fi
+      $SUDO docker info >/dev/null 2>&1 || { echo "dockerd failed to start; see $LOGS/dockerd.log"; exit 1; }
+      # Disposable dev VM: let the current user reach the socket without a re-login.
+      docker info >/dev/null 2>&1 || $SUDO chmod 666 /var/run/docker.sock
+
+      if [ ! -f "$ROOT/server/.env" ] || [ ! -f "$ROOT/clients/apps/web/.env.local" ]; then
+        (cd "$ROOT" && ./dev/setup-environment < /dev/null >/dev/null)
+      fi
+      # First boot pulls images (~4.4 GB) and creates empty volumes.
+      docker compose up -d --wait --wait-timeout 300 db redis minio tinybird
+      docker update --restart unless-stopped server-db-1 server-redis-1 server-minio-1 server-tinybird-1 >/dev/null 2>&1 || true
+      docker compose run --rm -T minio-setup >/dev/null
+
+      # Tinybird local issues its own admin token per container; mirror `dev up`.
+      TOKEN=""
+      for _ in $(seq 1 90); do
+        TOKEN=$(curl -sf http://localhost:7181/tokens | python3 -c 'import sys,json; print(json.load(sys.stdin)["admin_token"])' 2>/dev/null) && [ -n "$TOKEN" ] && break
+        sleep 2
+      done
+      if [ -n "$TOKEN" ]; then
+        SECRETS="${POLAR_SECRETS_FILE:-$HOME/.config/polar/secrets.env}"
+        mkdir -p "$(dirname "$SECRETS")"; touch "$SECRETS"; chmod 600 "$SECRETS"
+        for k in POLAR_TINYBIRD_API_TOKEN POLAR_TINYBIRD_READ_TOKEN POLAR_TINYBIRD_CLICKHOUSE_TOKEN; do
+          sed -i "/^$k=/d" "$SECRETS"; echo "$k=$TOKEN" >> "$SECRETS"
+        done
+        (cd "$ROOT" && ./dev/setup-environment < /dev/null >/dev/null)
+        # Capture logs first: `grep -q` closing the pipe early fails under pipefail.
+        for _ in $(seq 1 120); do
+          tb=$(docker compose logs tinybird 2>/dev/null || true)
+          case "$tb" in *"data project built successfully"*|*"rror"*"build"*) break ;; esac
+          sleep 2
+        done
+      else
+        echo "WARNING: Tinybird token unavailable; analytics features will not work"
+      fi
+
+      uv run task db_migrate
+      # seeds_load is phase-tracked; exit 2 = everything already seeded.
+      rc=0; uv run task seeds_load > "$LOGS/seed.log" 2>&1 || rc=$?
+      if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then echo "seed failed (rc=$rc); see $LOGS/seed.log"; tail -n 5 "$LOGS/seed.log"; exit 1; fi
+      echo "polar infra ready (seed rc=$rc)"
+      POLAR_EOF
+
+      cat > "$D/stop.sh" <<'POLAR_EOF'
+      #!/usr/bin/env bash
+      # Stop app processes started by start.sh (each runs in its own session; PID files in $LOGS).
+      # WEB_ONLY=1 stops just Next.js. INFRA=1 also stops the Docker services (volumes are kept).
+      set -uo pipefail
+      LOGS="${POLAR_LOGS:-/tmp/polar-logs}"
+      stop_group() {
+        local f="$LOGS/$1.pid" pid
+        [ -f "$f" ] || return 0
+        pid=$(cat "$f")
+        if kill -0 "$pid" 2>/dev/null; then
+          kill -TERM -- "-$pid" 2>/dev/null
+          for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+        fi
+        kill -KILL -- "-$pid" 2>/dev/null || true
+        rm -f "$f"
+      }
+      stop_group web
+      [ "${WEB_ONLY:-0}" = "1" ] && exit 0
+      stop_group proxy; stop_group api; stop_group worker
+      if [ "${INFRA:-0}" = "1" ]; then
+        . "$HOME/.polar-devin/common.sh"
+        (cd "$ROOT/server" && docker compose stop db redis minio tinybird)
+      fi
+      exit 0
+      POLAR_EOF
+
+      cat > "$D/start.sh" <<'POLAR_EOF'
+      #!/usr/bin/env bash
+      # Start the full local stack: infra, API :8000, worker, web :3000 and the
+      # same-origin proxy :4000 (preview entrypoint; API under /api).
+      # POLAR_BACKGROUND=1 detaches the proxy; otherwise it runs in the foreground.
+      set -euo pipefail
+      . "$HOME/.polar-devin/common.sh"
+      bash "$HOME/.polar-devin/infra.sh"
+      bash "$HOME/.polar-devin/stop.sh"
+
+      ORIGIN="http://127.0.0.1:4000"
+      export POLAR_BASE_URL="$ORIGIN/api"
+      export POLAR_FRONTEND_BASE_URL="$ORIGIN"
+      export POLAR_CHECKOUT_BASE_URL="$ORIGIN/api/v1/checkout-links/{client_secret}/redirect"
+      export POLAR_ALLOWED_HOSTS='["127.0.0.1:4000", "127.0.0.1:3000", "localhost:3000"]'
+      export POLAR_CORS_ORIGINS='["http://127.0.0.1:4000", "http://127.0.0.1:3000", "http://localhost:3000"]'
+
+      # Each process gets its own session (process group) and a PID file so stop.sh can
+      # stop it without pattern matching. API and worker run under a restart loop: under the
+      # 8 GiB cap the kernel can OOM-kill the worker while Next.js compiles; the loop restarts it.
+      launch() { local name="$1"; shift; setsid nohup "$@" > "$LOGS/$name.log" 2>&1 < /dev/null & echo $! > "$LOGS/$name.pid"; }
+      supervise() {
+        local name="$1"; shift
+        launch "$name" bash -c 'while true; do "$@"; echo "[restart-loop] $0 exited rc=$?; restarting in 3s"; sleep 3; done' "$name" "$@"
+      }
+      cd "$ROOT/server"
+      supervise api uv run task api
+      supervise worker uv run task worker
+
+      cd "$ROOT/clients/apps/web"
+      launch web env NEXT_TELEMETRY_DISABLED=1 \
+        NEXT_PUBLIC_API_URL="$ORIGIN/api" \
+        NEXT_PUBLIC_FRONTEND_BASE_URL="$ORIGIN" \
+        NEXT_PUBLIC_BACKOFFICE_URL="$ORIGIN/backoffice" \
+        POLAR_API_URL="http://127.0.0.1:8000" \
+        pnpm dev --port 3000
+
+      for _ in $(seq 1 90); do curl -sf -o /dev/null http://127.0.0.1:8000/healthz && break; sleep 2; done
+      curl -sf -o /dev/null http://127.0.0.1:8000/healthz || { echo "API failed; see $LOGS/api.log"; tail -n 20 "$LOGS/api.log"; exit 1; }
+      for _ in $(seq 1 90); do curl -sf -o /dev/null --max-time 120 http://127.0.0.1:3000/ && break; sleep 2; done
+      curl -sf -o /dev/null --max-time 120 http://127.0.0.1:3000/ || { echo "web failed; see $LOGS/web.log"; tail -n 20 "$LOGS/web.log"; exit 1; }
+      echo "polar running: http://127.0.0.1:4000 (API at /api; logs in $LOGS; login codes print in $LOGS/api.log)"
+      launch proxy node "$HOME/.polar-devin/preview-proxy.mjs"
+      for _ in $(seq 1 20); do curl -sf -o /dev/null http://127.0.0.1:4000/healthz && break; sleep 0.5; done
+      curl -sf -o /dev/null http://127.0.0.1:4000/healthz || { echo "proxy failed; see $LOGS/proxy.log"; exit 1; }
+      # Foreground mode (saved run command): stay attached to the proxy's log until it exits.
+      [ "${POLAR_BACKGROUND:-0}" = "1" ] || exec tail -n +1 -f --pid="$(cat "$LOGS/proxy.pid")" "$LOGS/proxy.log"
+      POLAR_EOF
+
+      cat > "$D/verify.sh" <<'POLAR_EOF'
+      #!/usr/bin/env bash
+      # Bounded health checks only (no test suites, no Stripe/GitHub).
+      set -uo pipefail
+      . "$HOME/.polar-devin/common.sh"
+      cd "$ROOT/server"
+      fail=0
+      chk() { local code; code=$(curl -s -o /dev/null -m 120 -w '%{http_code}' "$2"); printf '%-34s %s (want %s)\n' "$1" "$code" "$3"; [ "$code" = "$3" ] || fail=1; }
+      chk "API /healthz :8000"              http://127.0.0.1:8000/healthz 200
+      chk "proxy /healthz :4000"            http://127.0.0.1:4000/healthz 200
+      chk "API via proxy (unauthenticated)" http://127.0.0.1:4000/api/v1/organizations/ 401
+      chk "web / via proxy"                 http://127.0.0.1:4000/ 200
+      chk "web /auth (login) via proxy"     http://127.0.0.1:4000/auth 200
+      t=$(curl -s -m 60 http://127.0.0.1:4000/auth | grep -o '<title>[^<]*' | head -1 | sed 's/<title>//')
+      echo "auth page title: ${t:-<none>}"; case "$t" in *Polar*) ;; *) fail=1 ;; esac
+      chk "MinIO live :9000"                http://127.0.0.1:9000/minio/health/live 200
+      chk "Tinybird /tokens :7181"          http://127.0.0.1:7181/tokens 200
+      r=$(timeout 10 docker compose exec -T redis redis-cli ping 2>/dev/null); echo "redis: ${r:-<none>}"; [ "$r" = "PONG" ] || fail=1
+      p=$(timeout 15 docker compose exec -T db psql -U polar -d polar -tAc "select (select version_num from alembic_version) || ' orgs=' || (select count(*) from organizations)" 2>/dev/null); echo "postgres: ${p:-<none>}"; [ -n "$p" ] || fail=1
+      docker ps --format '{{.Names}} {{.Status}}' | grep '^server-' || fail=1
+      for p in 'uvicorn polar.app' 'bin/dramatiq' 'next-server' 'preview-proxy.mjs'; do pgrep -f "$p" >/dev/null && echo "process ok: $p" || { echo "process missing: $p"; fail=1; }; done
+      [ -r /sys/fs/cgroup/memory.current ] && echo "memory: $(( $(cat /sys/fs/cgroup/memory.current)/1048576 )) MiB"
+      [ "$fail" = 0 ] && echo "VERIFY OK" || { echo "VERIFY FAILED"; exit 1; }
+      POLAR_EOF
+
+      cat > "$D/login-state.py" <<'POLAR_EOF'
+      # Dev-only sign-in through Polar's real email-OTP flow, for browser checks.
+      # Starts an auth session via the proxy, requests an OTP (dummy always-pass Turnstile
+      # token from server/.env.template), reads the code the dev API prints to its log,
+      # verifies it, completes the session and writes a Playwright storage-state file.
+      # Usage: python3 login-state.py OUT.json   (env: POLAR_LOGIN_EMAIL, POLAR_ORIGIN, POLAR_API_LOG)
+      import http.cookiejar, json, os, re, sys, time, urllib.request, urllib.error
+      origin = os.environ.get("POLAR_ORIGIN", "http://127.0.0.1:4000")
+      email = os.environ.get("POLAR_LOGIN_EMAIL", "admin@polar.sh")
+      log = os.environ.get("POLAR_API_LOG", "/tmp/polar-logs/api.log")
+      out = sys.argv[1]
+      jar = http.cookiejar.CookieJar()
+      class NoRedirect(urllib.request.HTTPRedirectHandler):
+          def redirect_request(self, *a, **k): return None
+      opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar), NoRedirect)
+      def call(method, path, body=None):
+          data = None if body is None else json.dumps(body).encode()
+          req = urllib.request.Request(origin + path, data=data, method=method,
+              headers={"Content-Type": "application/json", "Origin": origin, "Referer": origin + "/login"})
+          try:
+              with opener.open(req, timeout=60) as r: return r.status, r.read()
+          except urllib.error.HTTPError as e: return e.code, e.read()
+      def offset():
+          try: return os.path.getsize(log)
+          except OSError: return 0
+      s, b = call("POST", "/api/v1/auth/start", {"return_to": "/dashboard"}); assert s == 201, (s, b[:300])
+      pos = offset()
+      s, b = call("POST", "/api/v1/auth/email-otp/request", {"email": email, "cf-turnstile-response": "XXXX.DUMMY.TOKEN.XXXX"}); assert s == 202, (s, b[:300])
+      code = None
+      for _ in range(60):
+          with open(log, "rb") as f:
+              f.seek(pos); m = re.findall(rb"LOGIN CODE: (\S+)", f.read())
+          if m: code = m[-1].decode(); break
+          time.sleep(0.5)
+      assert code, "login code not found in API log"
+      s, b = call("POST", "/api/v1/auth/email-otp/verify", {"code": code}); assert s == 200, (s, b[:300])
+      s, b = call("GET", "/api/v1/auth/complete"); assert s in (302, 303, 307), (s, b[:300])
+      cookies = [{"name": c.name, "value": c.value, "domain": "127.0.0.1", "path": c.path or "/",
+                  "expires": c.expires or -1, "httpOnly": bool(c.has_nonstandard_attr("HttpOnly") or c.has_nonstandard_attr("httponly")),
+                  "secure": bool(c.secure), "sameSite": "Lax"} for c in jar if c.value]
+      assert any(c["name"] == "polar_session" for c in cookies), [c["name"] for c in cookies]
+      fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+      with os.fdopen(fd, "w") as f: json.dump({"cookies": cookies, "origins": []}, f)
+      print(f"signed in as {email}; storage state written ({len(cookies)} cookies)")
+      POLAR_EOF
+
+      cat > "$D/construct-recipe.json" <<'POLAR_EOF'
+      {
+        "id": "polar-dev-product-create",
+        "name": "Signed-in admin creates a product in the local Polar dashboard",
+        "outcomes": [
+          {
+            "id": "signed-in-dashboard",
+            "description": "Signed in as the seeded admin, the Admin Org overview dashboard loads with its sidebar and Revenue / Available balance widgets",
+            "startStep": 1,
+            "endStep": 5
+          },
+          {
+            "id": "create-product",
+            "description": "Creating a new fixed-price product named 'Setup check <run id>' succeeds",
+            "startStep": 6,
+            "endStep": 11
+          },
+          {
+            "id": "product-listed",
+            "description": "After a fresh load of the Products catalogue, the new product is listed",
+            "startStep": 12,
+            "endStep": 15
+          }
+        ],
+        "steps": [
+          {
+            "action": "goto",
+            "path": "/dashboard/admin-org"
+          },
+          {
+            "action": "wait-for-text",
+            "selector": "main",
+            "value": "No payouts yet",
+            "timeoutMs": 60000
+          },
+          {
+            "action": "assert-computed-style",
+            "selector": "main div.flex.w-full.flex-col.pb-8",
+            "property": "opacity",
+            "value": "1",
+            "note": "wait for the dashboard content fade-in to finish"
+          },
+          {
+            "action": "assert-visible-any",
+            "targets": [
+              {
+                "by": "role",
+                "role": "link",
+                "name": "Payouts"
+              }
+            ]
+          },
+          {
+            "action": "assert-text",
+            "selector": "main",
+            "value": "Available balance"
+          },
+          {
+            "action": "goto",
+            "path": "/dashboard/admin-org/products/new"
+          },
+          {
+            "action": "fill",
+            "target": {
+              "by": "label",
+              "value": "Name"
+            },
+            "value": "Setup check {run:id}"
+          },
+          {
+            "action": "fill",
+            "target": {
+              "by": "label",
+              "value": "prices.0.price_amount"
+            },
+            "value": "19"
+          },
+          {
+            "action": "click",
+            "target": {
+              "by": "role",
+              "role": "button",
+              "name": "Create Product"
+            }
+          },
+          {
+            "action": "wait-for-url-not-contains",
+            "value": "/products/new",
+            "timeoutMs": 60000
+          },
+          {
+            "action": "assert-text",
+            "selector": "main",
+            "value": "Setup check {run:id}"
+          },
+          {
+            "action": "goto",
+            "path": "/dashboard/admin-org/products"
+          },
+          {
+            "action": "assert-computed-style",
+            "selector": "main div.flex.w-full.flex-col.pb-8",
+            "property": "opacity",
+            "value": "1",
+            "note": "wait for the page content fade-in to finish"
+          },
+          {
+            "action": "assert-visible-any",
+            "targets": [
+              {
+                "by": "role",
+                "role": "link",
+                "name": "Catalogue"
+              }
+            ]
+          },
+          {
+            "action": "assert-text",
+            "selector": "main",
+            "value": "Setup check {run:id}"
+          }
+        ]
+      }
+      POLAR_EOF
+
+      cat > "$D/preview-proxy.mjs" <<'POLAR_EOF'
+      // Same-origin dev proxy (no dependencies). The app is configured with the local
+      // origin http://127.0.0.1:4000 (API under /api). For requests arriving through a
+      // public preview host, it maps that host to the local origin on the way in and
+      // back to the public origin on the way out, so any forwarded URL works without
+      // source or env-file changes. Dev only: strips frame-blocking headers and makes
+      // cookies SameSite=None; Secure; Partitioned so the app works inside an iframe.
+      import http from 'node:http'
+      import net from 'node:net'
+      import { Transform } from 'node:stream'
+
+      const PORT = Number(process.env.PROXY_PORT || 4000)
+      const LOCAL = `127.0.0.1:${PORT}`
+      const LOCAL_ORIGIN = `http://${LOCAL}`
+      const WEB = { host: '127.0.0.1', port: Number(process.env.WEB_PORT || 3000) }
+      const API = { host: '127.0.0.1', port: Number(process.env.API_PORT || 8000) }
+      const TEXT = /text\/|json|javascript|x-component|xml|svg/
+      const API_PATHS = /^\/(api(\/|$)|v1\/|backoffice(\/|$)|healthz|readyz|\.well-known\/(openid|oauth|jwks))/
+
+      const seen = new Set()
+      function publicOrigin(req) {
+        const host = (req.headers['x-forwarded-host'] || req.headers.host || LOCAL).split(',')[0].trim()
+        if (host === LOCAL || host.startsWith('localhost:') || host.startsWith('127.0.0.1:')) return null
+        const proto = (req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim()
+        const origin = `${proto}://${host}`
+        if (!seen.has(origin)) { seen.add(origin); console.log(`public origin seen (host=${req.headers.host})`) }
+        return origin
+      }
+
+      function pairs(pub) {
+        return [
+          [LOCAL_ORIGIN, pub],
+          [encodeURIComponent(LOCAL_ORIGIN), encodeURIComponent(pub)],
+          [LOCAL_ORIGIN.replaceAll('/', '\\/'), pub.replaceAll('/', '\\/')],
+        ]
+      }
+      const swap = (s, list, dir) =>
+        list.reduce((acc, [a, b]) => (dir ? acc.split(a).join(b) : acc.split(b).join(a)), s)
+
+      function rewriter(list) {
+        const keep = Math.max(...list.map(([a]) => a.length)) - 1
+        let tail = ''
+        return new Transform({
+          transform(chunk, _e, cb) {
+            const s = swap(tail + chunk.toString('utf8'), list, true)
+            tail = s.slice(-keep)
+            cb(null, s.slice(0, -keep))
+          },
+          flush(cb) { cb(null, tail) },
+        })
+      }
+
+      function route(url) {
+        if (API_PATHS.test(url)) {
+          const path = url.replace(/^\/api(?=\/|$|\?)/, '') || '/'
+          return { target: API, path: path.startsWith('/') ? path : '/' + path }
+        }
+        return { target: WEB, path: url }
+      }
+
+      function inboundHeaders(req, pub) {
+        const h = { ...req.headers, host: LOCAL }
+        delete h['accept-encoding']
+        if (pub) {
+          const list = pairs(pub)
+          for (const k of ['origin', 'referer']) if (h[k]) h[k] = swap(h[k], list, false)
+        }
+        delete h['x-forwarded-host']
+        return h
+      }
+
+      const server = http.createServer((req, res) => {
+        const pub = publicOrigin(req)
+        const list = pub ? pairs(pub) : null
+        const url = list ? swap(req.url, list, false) : req.url
+        const { target, path } = route(url)
+        const up = http.request({ ...target, method: req.method, path, headers: inboundHeaders(req, pub) }, (ur) => {
+          const headers = { ...ur.headers }
+          // Dev preview only: allow the app to be framed by a preview pane.
+          delete headers['x-frame-options']
+          if (headers['content-security-policy'])
+            headers['content-security-policy'] = String(headers['content-security-policy']).replace(/frame-ancestors[^;]*;?/gi, '')
+          if (list) {
+            if (headers.location) headers.location = swap(headers.location, list, true)
+            if (headers['content-security-policy'])
+              headers['content-security-policy'] = swap(headers['content-security-policy'], list, true)
+            if (headers['set-cookie'])
+              headers['set-cookie'] = [].concat(headers['set-cookie']).map((c) =>
+                // Dev preview only: a framed HTTPS preview is cross-site, so Lax cookies would
+                // never be sent back. Use SameSite=None; Secure; Partitioned (CHIPS).
+                c.replace(/;\s*Domain=[^;]*/i, '')
+                  .replace(/;\s*SameSite=[^;]*/i, '')
+                  .replace(/;\s*Secure(?=;|$)/i, '')
+                  .replace(/;\s*Partitioned(?=;|$)/i, '') + '; SameSite=None; Secure; Partitioned')
+          }
+          const isText = TEXT.test(headers['content-type'] || '')
+          if (list && isText) {
+            delete headers['content-length']
+            res.writeHead(ur.statusCode, headers)
+            ur.pipe(rewriter(list)).pipe(res)
+          } else {
+            res.writeHead(ur.statusCode, headers)
+            ur.pipe(res)
+          }
+        })
+        up.on('error', (e) => { if (!res.headersSent) res.writeHead(502); res.end(`proxy error: ${e.message}`) })
+        req.pipe(up)
+      })
+
+      server.on('upgrade', (req, socket, head) => {
+        const pub = publicOrigin(req)
+        const { target, path } = route(pub ? swap(req.url, pairs(pub), false) : req.url)
+        const upstream = net.connect(target.port, target.host, () => {
+          const h = inboundHeaders(req, pub)
+          upstream.write(`${req.method} ${path} HTTP/1.1\r\n` +
+            Object.entries(h).map(([k, v]) => `${k}: ${v}`).join('\r\n') + '\r\n\r\n')
+          if (head?.length) upstream.write(head)
+          upstream.pipe(socket); socket.pipe(upstream)
+        })
+        upstream.on('error', () => socket.destroy()); socket.on('error', () => upstream.destroy())
+      })
+
+      server.listen(PORT, '0.0.0.0', () => console.log(`polar preview proxy on :${PORT}`))
+      POLAR_EOF
+
+      chmod +x "$D"/*.sh
+      ls -l "$D"
+
+maintenance:
+  - name: "Toolchain PATH + pnpm (native binary matching clients/package.json packageManager)"
+    run: |
+      export PATH="$HOME/.local/share/polar-node/v24.22.2/bin:$HOME/.local/bin:$PATH"
+      node --version
+      PNPM_VERSION=$(sed -n 's/.*"packageManager": *"pnpm@\([0-9.]*\).*/\1/p' clients/package.json)
+      PNPM_PREFIX="$HOME/.local/share/polar-pnpm/$PNPM_VERSION"
+      # The corepack shim breaks turbo ("Exec format error"); see dev/CLOUD_AGENTS.md.
+      [ -x "$PNPM_PREFIX/bin/pnpm" ] || npm install -g --prefix "$PNPM_PREFIX" "pnpm@$PNPM_VERSION"
+      mkdir -p "$HOME/.local/bin"
+      ln -sf "$PNPM_PREFIX/bin/pnpm" "$HOME/.local/bin/pnpm"
+      ln -sf "$PNPM_PREFIX/bin/pnpx" "$HOME/.local/bin/pnpx"
+      pnpm --version
+
+  - name: "Local env files (gitignored dev defaults; only when missing)"
+    run: |
+      export PATH="$HOME/.local/share/polar-node/v24.22.2/bin:$HOME/.local/bin:$PATH"
+      if [ ! -f server/.env ] || [ ! -f clients/apps/web/.env.local ]; then
+        ./dev/setup-environment < /dev/null
+      fi
+
+  - name: "Python dependencies (no-op when uv.lock is unchanged)"
+    run: |
+      export PATH="$HOME/.local/share/polar-node/v24.22.2/bin:$HOME/.local/bin:$PATH"
+      uv sync --dev --frozen --directory server
+
+  - name: "JS dependencies (no-op when pnpm-lock.yaml is unchanged)"
+    run: |
+      export PATH="$HOME/.local/share/polar-node/v24.22.2/bin:$HOME/.local/bin:$PATH"
+      pnpm --dir clients install --frozen-lockfile
+
+  - name: "Build artifacts (emails/backoffice only when missing; packages via turbo cache)"
+    run: |
+      export PATH="$HOME/.local/share/polar-node/v24.22.2/bin:$HOME/.local/bin:$PATH"
+      [ -f server/emails/bin/react-email-pkg ] || uv run --directory server task emails
+      [ -f server/polar/backoffice/static/scripts.js ] || uv run --directory server task backoffice
+      pnpm --dir clients exec turbo run build --filter='./packages/*'
+
+knowledge:
+  - name: dev-server
+    contents: |
+      Start everything from the repo root (helpers are generated by this blueprint's initialize):
+        bash "$HOME/.polar-devin/start.sh"                       # stays attached to the proxy log
+        POLAR_BACKGROUND=1 bash "$HOME/.polar-devin/start.sh"    # fully detached
+      Order: dockerd (started directly if no systemd) -> docker compose up --wait db redis minio
+      tinybird (from server/) -> minio-setup -> local Tinybird admin token written to
+      ~/.config/polar/secrets.env -> dev/setup-environment regenerates server/.env and
+      clients/apps/web/.env.local -> `uv run task db_migrate` -> `uv run task seeds_load`
+      (exit 2 = already seeded) -> then each in its own session with a PID file in /tmp/polar-logs:
+        - API     http://127.0.0.1:8000  (uv run task api; restart loop)
+        - worker  dramatiq (uv run task worker; restart loop)
+        - web     http://127.0.0.1:3000  (pnpm dev in clients/apps/web, Node 24.22.2)
+        - proxy   http://127.0.0.1:4000  same-origin entrypoint; /api/* -> API, rest -> web
+      Open/preview http://127.0.0.1:4000 (not :3000) so cookies and API calls share one origin.
+      Restart: run start.sh again (it stops the previous app processes first; infra is idempotent).
+      Stop: bash "$HOME/.polar-devin/stop.sh"  (WEB_ONLY=1 just Next.js, INFRA=1 also Docker).
+      stop.sh uses PID files/process groups, not pkill patterns, so it cannot kill an agent shell
+      whose command text happens to mention a process name.
+      Logs: /tmp/polar-logs/{api,worker,web,proxy,seed,dockerd}.log. The first visit of each route
+      compiles in Next.js dev (tens of seconds); later loads are fast.
+      Type Space commands: setup `bash "$HOME/.polar-devin/setup.sh"`, run `bash "$HOME/.polar-devin/start.sh"`.
+      Every new sandbox must re-run start.sh: snapshots keep files/dependencies, not processes.
+
+  - name: verify
+    contents: |
+      1) Bounded health checks: bash "$HOME/.polar-devin/verify.sh"  -> prints "VERIFY OK".
+         Expects API /healthz 200 on :8000 and :4000; /api/v1/organizations/ 401 unauthenticated;
+         web / and /auth 200 with a "Polar" title; MinIO live 200; Tinybird /tokens 200; Redis PONG;
+         Postgres at alembic head (4e8b2d1f9a63 when verified) with 8 seeded organizations;
+         api/worker/next-server/proxy processes running.
+      2) Authenticated browser workflow with Type Construct (verified in the setup sandbox):
+           mkdir -p /tmp/construct && chmod 700 /tmp/construct
+           python3 "$HOME/.polar-devin/login-state.py" /tmp/construct/state.json
+           construct --base-url http://127.0.0.1:4000/ --repo "$PWD" \
+             --steps "$HOME/.polar-devin/construct-recipe.json" --storage-state /tmp/construct/state.json
+         Recipe (inlined above as construct-recipe.json): as admin@polar.sh open
+         /dashboard/admin-org, wait for "No payouts yet" in main and the sidebar "Products" link
+         (widgets fade in after data loads), wait for the content wrapper's opacity to reach 1,
+         assert the "Payouts" link and "Available balance"; open /dashboard/admin-org/products/new, fill
+         Name "Setup check {run:id}" and price 19, click "Create Product", wait for the URL to
+         leave /products/new and assert the name; reload /dashboard/admin-org/products, wait for opacity 1
+         and the "Catalogue" link, and assert the name is listed. Add --fast while iterating; the final run must record video.
+         Known dev-only noise: the Next.js dev overlay may show "1 Issue" (a React hydration
+         attribute-mismatch warning from app code); it does not affect the workflow.
+         Regenerate the storage state right before each run (sessions are short-lived) and delete
+         /tmp/construct/state.json afterwards; never commit it.
+
+  - name: login
+    contents: |
+      Supported dev login: email OTP, no secrets. Seeded users include admin@polar.sh (admin,
+      member of admin-org, acme-corp, etc.). Emails are not sent in development; the API prints
+      "LOGIN CODE: XXXXXX" to /tmp/polar-logs/api.log:
+        grep -a 'LOGIN CODE' /tmp/polar-logs/api.log | tail -1
+      In the UI: /auth -> enter email -> enter the code. Turnstile uses Cloudflare's documented
+      always-pass test keys from server/.env.template (needs outbound HTTPS to Cloudflare).
+      login-state.py performs this same real flow over HTTP (/api/v1/auth/start ->
+      email-otp/request -> read code from the log -> email-otp/verify -> complete) and writes a
+      Playwright storage state for Construct. Codes expire after ~15 minutes.
+      GitHub/Google sign-in are not configured.
+
+  - name: docker-and-seed-reconstruction
+    contents: |
+      Images/volumes are not created by initialize or maintenance; the first start.sh pulls
+      postgres:15.1-bullseye, redis:alpine, bitnamilegacy/minio, bitnamilegacy/minio-client and
+      tinybirdco/tinybird-local:latest (~4.4 GB) into /var/lib/docker (overlay2 via
+      /etc/docker/daemon.json; on the Type sandbox that is a separate large volume, keeping the
+      10 GB root disk free). Re-runs are cheap: migrations are no-ops at head, seeds are
+      phase-tracked. Reset data: (cd server && docker compose down -v) then start.sh.
+      Tinybird local mints a new admin token per container; infra.sh re-reads it from :7181/tokens.
+      After a snapshot restore, stale /var/run/docker state is cleared before dockerd starts.
+
+  - name: memory-and-disk
+    contents: |
+      The Type sandbox has an 8 GiB cgroup memory limit and a 10 GB root disk. Steady state with
+      the full stack is ~5.8-7.2 GiB anonymous memory (Tinybird ~2.2 GiB, next-server 1.2-1.7 GiB
+      plus ~1-2 GiB of turbopack loader workers, API+worker ~1.5 GiB, MinIO ~0.35 GiB). During the
+      first route compiles plus a Construct Chromium the kernel OOM-killed the dramatiq worker;
+      start.sh therefore runs API and worker under restart loops and compose services use
+      restart=unless-stopped. Free memory with WEB_ONLY=1 stop.sh or `cd server && docker compose
+      stop tinybird` (disables analytics). Do not run test suites alongside the web dev server.
+      Root disk after maintenance: ~7.1 GB used of 10 GB (node_modules, .venv, pnpm/uv caches).
+
+  - name: secrets
+    contents: |
+      No secrets are required for local development, migrations, seed, login, verify or the
+      Construct workflow. dev/setup-environment generates gitignored local-only env files with
+      random dev keys. Optional integrations read ~/.config/polar/secrets.env (POLAR_SECRETS_FILE
+      overrides) which setup-environment merges into server/.env. Optional names from
+      dev/secrets.env.template: POLAR_STRIPE_SECRET_KEY, POLAR_STRIPE_PUBLISHABLE_KEY,
+      POLAR_STRIPE_WEBHOOK_SECRET, POLAR_STRIPE_CONNECT_WEBHOOK_SECRET,
+      POLAR_STRIPE_ACCOUNT_RISK_WEBHOOK_SECRET, POLAR_GITHUB_CLIENT_ID, POLAR_GITHUB_CLIENT_SECRET,
+      POLAR_GITHUB_APP_* and POLAR_GITHUB_REPOSITORY_BENEFITS_*, POLAR_PYDANTIC_AI_GATEWAY_API_KEY,
+      E2E_ORG_TOKEN. Supply them as platform secrets (Type encrypted environment / Devin secrets)
+      and write them into that file only for the session that needs them; never bake them into a
+      snapshot and never point local env files at production resources.
+
+  - name: lint
+    contents: |
+      Backend (server/): `uv run task lint` and `uv run task lint_types` (see server/AGENTS.md).
+      Frontend (clients/): `pnpm --dir clients lint` (see clients/AGENTS.md).
+      Use the PATH from common.sh (Node 24.22.2 prefix + ~/.local/bin pnpm 12.8.0).
+
+  - name: test
+    contents: |
+      Not run during setup verification. Backend: `cd server && uv run task test` (needs Postgres;
+      keep xdist workers low under 8 GiB). Frontend: scope turbo, e.g.
+      `pnpm --dir clients test --filter=web --concurrency=2` (unscoped runs time out spuriously;
+      see dev/CLOUD_AGENTS.md). Stop the web dev server first (WEB_ONLY=1 stop.sh).
+
+  - name: build
+    contents: |
+      Shared JS packages: `pnpm --dir clients exec turbo run build --filter='./packages/*'`.
+      Email renderer: `uv run --directory server task emails` (required for server config import).
+      Backoffice assets: `uv run --directory server task backoffice`.
+      Runtimes verified: Node 24.22.2 (private prefix ~/.local/share/polar-node), pnpm 12.8.0
+      (native binary under ~/.local/share/polar-pnpm), uv 0.13.6, Python 3.14 (uv-managed),
+      Docker 29.9.2 + Compose v5.6.1, Debian 13.
