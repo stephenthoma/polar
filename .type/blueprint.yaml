@@ -9,8 +9,11 @@ initialize:
   - name: "System packages"
     run: |
       SUDO=""; [ "$(id -u)" -eq 0 ] || SUDO="sudo"
-      $SUDO apt-get update
-      $SUDO apt-get install -y --no-install-recommends ca-certificates curl git jq build-essential python3
+      # Skip apt entirely when everything is already present (keeps re-runs incremental).
+      if ! dpkg -s ca-certificates curl git jq build-essential python3 >/dev/null 2>&1; then
+        $SUDO apt-get update
+        $SUDO apt-get install -y --no-install-recommends ca-certificates curl git jq build-essential python3
+      fi
 
   - name: "Node.js 24 (user-local under $HOME/.local/share/polar-node; leaves any system/nvm Node untouched)"
     run: |
@@ -683,6 +686,16 @@ knowledge:
       Services that must be restarted in every new sandbox/snapshot restore: dockerd, the compose
       services, API, worker, web, proxy (start.sh does all of it; it is safe to re-run).
       First visit of each route compiles in Next.js dev (10-60 s); later loads are fast.
+
+  - name: type-commands
+    contents: |
+      Type's saved Space commands execute this file directly, so they never depend on leftover state:
+        setup: run every `initialize` step, then every `maintenance` step, from .type/blueprint.yaml
+               (falls back to .devin/blueprint.yaml), each with bash -euo pipefail. All steps are
+               guarded, so re-runs on a snapshot take ~15 s.
+        run:   re-run only the "Polar helper scripts" initialize step (rewrites $HOME/.polar-devin),
+               then `exec bash "$HOME/.polar-devin/start.sh"` (proxy in the foreground on :4000).
+      The step runner is a short inline Python script using PyYAML (python3, or `uv run --with pyyaml`).
 
   - name: tinybird-off-by-default
     contents: |
