@@ -120,7 +120,7 @@ class TinybirdClient:
             headers={"Authorization": f"Bearer {api_token}"} if api_token else {},
             timeout=httpx.Timeout(25.0, connect=10.0),
             transport=(
-                httpx.MockTransport(lambda _: httpx.Response(200))
+                httpx.MockTransport(lambda _: httpx.Response(200, json={}))
                 if api_token is None
                 else None
             ),
@@ -289,6 +289,10 @@ class TinybirdClient:
         *,
         db_statement: str,
     ) -> list[dict[str, Any]]:
+        # Mirror the HTTP clients: without a token (e.g. local dev without
+        # Tinybird running), behave as an empty Tinybird instead of connecting.
+        if self._clickhouse_token is None:
+            return []
         operation = sql.strip().split(None, 1)[0].upper() if sql.strip() else "QUERY"
         with tracer.start_as_current_span(f"{operation} tinybird") as span:
             span.set_attribute("db.system", "clickhouse")
